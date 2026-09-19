@@ -15,7 +15,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Проверка загрузки всех необходимых ключей
+# Проверка наличия всех ключей
 missing_keys = [
     name for name, val in [
         ("GEMINI_API_KEY", GEMINI_API_KEY),
@@ -28,50 +28,54 @@ missing_keys = [
 if missing_keys:
     raise ValueError(f"❌ Ошибка: Не найдены следующие GitHub Secrets: {', '.join(missing_keys)}")
 
-# Ограничение работы скрипта (3 часа = 10800 секунд, чтобы уложиться в timeout-minutes: 210)
-WORK_DURATION_SECONDS = 3 * 3600  
+# Время работы скрипта (3 часа = 10800 секунд)
+WORK_DURATION_SECONDS = 3 * 3600
 
-# --- 2. ДИНАМИЧЕСКИЙ ФИЛЬТР ТОП-15 МОНЕТ ---
-async def get_top_15_symbols(exchange: ccxt_async.binance) -> list:
-    """Получает ТОП-15 монет по объему торгов за 24 часа"""
+# --- 2. ПОЛУЧЕНИЕ ТОП-15 МОНЕТ (BYBIT) ---
+async def get_top_15_symbols(exchange: ccxt_async.bybit) -> list:
+    """Загружает ТОП-15 монет по суточному объему торгов с Bybit"""
     try:
-        print("🔍 Загрузка ТОП-15 монет по суточному объему...")
+        print("🔍 Загрузка ТОП-15 монет по суточному объему (Bybit)...")
         tickers = await exchange.fetch_tickers()
         stables_and_wraps = {'USDC', 'USDT', 'FDUSD', 'DAI', 'TUSD', 'WBTC', 'WBETH', 'USDE'}
-        
+
         candidates = []
         for symbol, ticker in tickers.items():
             if not symbol.endswith('/USDT'):
                 continue
-            
+
             base = symbol.split('/')[0]
             if base in stables_and_wraps:
                 continue
 
             quote_volume = ticker.get('quoteVolume', 0)
+            if not quote_volume and ticker.get('baseVolume') and ticker.get('last'):
+                quote_volume = ticker['baseVolume'] * ticker['last']
+
             if quote_volume and quote_volume > 0:
+                clean_symbol = symbol.replace('/', '').split(':')[0]
                 candidates.append({
-                    'symbol': symbol.replace('/', '').replace(':USDT', ''),
+                    'symbol': clean_symbol,
                     'volume': quote_volume
                 })
-        
+
         sorted_candidates = sorted(candidates, key=lambda x: x['volume'], reverse=True)
         top_15 = [c['symbol'] for c in sorted_candidates[:15]]
-        print(f"✅ Отслеживаем: {', '.join(top_15)}")
+        print(f"✅ Отслеживаем (Bybit): {', '.join(top_15)}")
         return top_15
     except Exception as e:
-        print(f"⚠️ Ошибка при получении ТОП монет: {e}. Используем базовый список.")
+        print(f"⚠️ Ошибка при получении ТОП монет Bybit: {e}. Используем базовый список.")
         return [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
             "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT",
             "NEARUSDT", "DOTUSDT", "LTCUSDT", "APTUSDT", "PEPEUSDT"
         ]
 
-# --- 3. ЗАГРУЗКА ДАННЫХ И ОТРИСОВКА ГРАФИКА ---
+# --- 3. ГЕНЕРАЦИЯ ГРАФИКА ---
 def generate_chart_sync(symbol: str, dataframe: pd.DataFrame) -> str:
     clean_symbol = symbol.replace('/', '_').replace(':', '')
     image_path = f"chart_{clean_symbol}.png"
-    
+
     mpf.plot(
         dataframe,
         type='candle',
@@ -81,10 +85,10 @@ def generate_chart_sync(symbol: str, dataframe: pd.DataFrame) -> str:
     )
     return image_path
 
-async def fetch_and_draw_chart_async(exchange: ccxt_async.binance, symbol: str) -> str:
-    ccxt_symbol = f"{symbol[:-4]}/USDT" if symbol.endswith("USDT") else symbol
+async def fetch_and_draw_chart_async(exchange: ccxt_async.bybit, symbol: str) -> str:
+    ccxt_symbol = f"{symbol[:-4]}/USDT" if symbol.endswith("USDT") and '/' not in symbol else symbol
     ohlcv = await exchange.fetch_ohlcv(ccxt_symbol, timeframe="15m", limit=40)
-    
+
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -157,10 +161,10 @@ async def analyze_groq_async(session: ClientSession, vision_json: dict) -> dict:
         print(f"❌ Ошибка Groq: {e}")
         return {"verdict": "REJECT", "reasons": [f"Ошибка API Groq: {e}"]}
 
-# --- 6. TELEGRAM SENDER ---
+# --- 6. ОТПРАВКА В TELEGRAM ---
 async def send_telegram_async(session: ClientSession, symbol: str, vision_data: dict, final_verdict: dict, image_path: str):
     caption = (
-        f"🚨 **СИГНАЛ JUDAS SWING: {symbol}**\n\n"
+        f"🚨 **СИГНАЛ JUDAS SWING (BYBIT): {symbol}**\n\n"
         f"📍 **Вердикт:** `{final_verdict.get('verdict')}`\n"
         f"📊 **Качество свипа:** {vision_data.get('sweep_quality', 'N/A')}\n"
         f"⚡ **CHOCH / FVG:** {vision_data.get('choch_detected')}/{vision_data.get('fvg_detected')}\n"
@@ -184,8 +188,8 @@ async def send_telegram_async(session: ClientSession, symbol: str, vision_data: 
     except Exception as e:
         print(f"❌ Ошибка Telegram: {e}")
 
-# --- 7. ОБРАБОТЧИК ЗАКРЫТИЯ СВЕЧИ ---
-async def process_candle_event(session: ClientSession, exchange: ccxt_async.binance, symbol: str):
+# --- 7. ОБРАБОТКА ЗАКРЫТИЯ СВЕЧИ ---
+async def process_candle_event(session: ClientSession, exchange: ccxt_async.bybit, symbol: str):
     print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Свеча 15m закрылась по {symbol}. Анализируем...")
     image_path = None
     try:
@@ -202,44 +206,76 @@ async def process_candle_event(session: ClientSession, exchange: ccxt_async.bina
         if image_path and os.path.exists(image_path):
             os.remove(image_path)
 
-# --- 8. WEBSOCKET СЛУШАТЕЛЬ С ОГРАНИЧЕНИЕМ ПО ВРЕМЕНИ ---
-async def binance_websocket_listener(session: ClientSession, exchange: ccxt_async.binance):
+# --- 8. WEBSOCKET СЛУШАТЕЛЬ (BYBIT V5) ---
+async def send_bybit_ping(ws, end_time):
+    """Каждые 20 секунд отправляет ping для поддержания Bybit WebSocket соединения"""
+    try:
+        while datetime.now() < end_time:
+            await asyncio.sleep(20)
+            await ws.send(json.dumps({"op": "ping"}))
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+async def bybit_websocket_listener(session: ClientSession, exchange: ccxt_async.bybit):
     symbols = await get_top_15_symbols(exchange)
-    stream_names = "/".join([f"{s.lower()}@kline_15m" for s in symbols])
-    ws_url = f"wss://stream.binance.com:9443/ws/{stream_names}"
+    ws_url = "wss://stream.bybit.com/v5/public/spot"
 
     start_time = datetime.now()
     end_time = start_time + timedelta(seconds=WORK_DURATION_SECONDS)
 
-    print(f"⏰ Запуск сканирования на 3 часа (до {end_time.strftime('%H:%M:%S')})...")
+    print(f"⏰ Запуск сканирования Bybit на 3 часа (до {end_time.strftime('%H:%M:%S')})...")
 
     while datetime.now() < end_time:
         try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-                print("✅ WebSocket подключен. Слушаем 15m свечи...")
-                while datetime.now() < end_time:
-                    try:
-                        # Таймаут 1 секунда, чтобы регулярно проверять condition времени (end_time)
-                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            async with websockets.connect(ws_url) as ws:
+                # Подписываемся на 15m свечи для выбранных монет
+                args = [f"kline.15.{s}" for s in symbols]
+                sub_msg = {"op": "subscribe", "args": args}
+                await ws.send(json.dumps(sub_msg))
+
+                print("✅ WebSocket Bybit подключен. Слушаем 15m свечи...")
+                
+                # Запускаем фоновую задачу ping-понга для Bybit
+                ping_task = asyncio.create_task(send_bybit_ping(ws, end_time))
+
+                try:
+                    while datetime.now() < end_time:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
                         data = json.loads(msg)
 
-                        if data.get('e') == 'kline' and data['k'].get('x'):
-                            asyncio.create_task(process_candle_event(session, exchange, data['s']))
-                    except asyncio.TimeoutError:
-                        continue
+                        # Проверяем приход kline сообщения и закрытие свечи (confirm == True)
+                        if "topic" in data and data["topic"].startswith("kline.15."):
+                            symbol = data["topic"].split(".")[-1]
+                            kline_list = data.get("data", [])
+                            for kline in kline_list:
+                                if kline.get("confirm") is True:
+                                    asyncio.create_task(process_candle_event(session, exchange, symbol))
+
+                finally:
+                    ping_task.cancel()
+
+        except asyncio.TimeoutError:
+            continue
         except Exception as e:
             if datetime.now() < end_time:
-                print(f"⚠️ Ошибка сети: {e}. Переподключение...")
+                print(f"⚠️ Ошибка сети Bybit WS: {e}. Переподключение через 5 секунд...")
                 await asyncio.sleep(5)
 
     print("🏁 3 часа работы истекли. Завершаем работу сессии GitHub Actions.")
 
 # --- 9. ТОЧКА ВХОДА ---
 async def main():
-    exchange = ccxt_async.binance({'enableRateLimit': True})
+    exchange = ccxt_async.bybit({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',
+        }
+    })
     async with ClientSession() as session:
         try:
-            await binance_websocket_listener(session, exchange)
+            await bybit_websocket_listener(session, exchange)
         finally:
             await exchange.close()
 
