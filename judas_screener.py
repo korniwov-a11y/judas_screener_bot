@@ -2,31 +2,41 @@ import asyncio
 import os
 import json
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import mplfinance as mpf
 import ccxt.async_support as ccxt_async
-from aiohttp import web, ClientSession, FormData
+from aiohttp import ClientSession, FormData
 import websockets
 
-# --- 1. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
+# --- 1. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (GitHub Secrets) ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-PORT = int(os.getenv("PORT", 8080))
+
+# Проверка загрузки всех необходимых ключей
+missing_keys = [
+    name for name, val in [
+        ("GEMINI_API_KEY", GEMINI_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
+        ("BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+        ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+    ] if not val
+]
+
+if missing_keys:
+    raise ValueError(f"❌ Ошибка: Не найдены следующие GitHub Secrets: {', '.join(missing_keys)}")
+
+# Ограничение работы скрипта (3 часа = 10800 секунд, чтобы уложиться в timeout-minutes: 210)
+WORK_DURATION_SECONDS = 3 * 3600  
 
 # --- 2. ДИНАМИЧЕСКИЙ ФИЛЬТР ТОП-15 МОНЕТ ---
 async def get_top_15_symbols(exchange: ccxt_async.binance) -> list:
-    """
-    Получает топ-15 USDT-пар по комбинации Капитализации и 24h Объема торгов.
-    Фильтрует стейблкоины и wrap-токены.
-    """
+    """Получает ТОП-15 монет по объему торгов за 24 часа"""
     try:
-        print("🔍 Обновление списка ТОП-15 монет по капитализации и объему...")
+        print("🔍 Загрузка ТОП-15 монет по суточному объему...")
         tickers = await exchange.fetch_tickers()
-        
-        # Исключаем стейблкоины и обернутые активы
         stables_and_wraps = {'USDC', 'USDT', 'FDUSD', 'DAI', 'TUSD', 'WBTC', 'WBETH', 'USDE'}
         
         candidates = []
@@ -38,44 +48,27 @@ async def get_top_15_symbols(exchange: ccxt_async.binance) -> list:
             if base in stables_and_wraps:
                 continue
 
-            quote_volume = ticker.get('quoteVolume', 0) # Объём в USDT
+            quote_volume = ticker.get('quoteVolume', 0)
             if quote_volume and quote_volume > 0:
                 candidates.append({
-                    'symbol': symbol.replace('/', '').replace(':USDT', ''), # Перевод в формат BTCUSDT
-                    'ccxt_symbol': symbol,
+                    'symbol': symbol.replace('/', '').replace(':USDT', ''),
                     'volume': quote_volume
                 })
         
-        # Сортировка по объему торгов и выбор TOP-15
         sorted_candidates = sorted(candidates, key=lambda x: x['volume'], reverse=True)
         top_15 = [c['symbol'] for c in sorted_candidates[:15]]
-        
-        print(f"✅ Выбран ТОП-15 монет: {', '.join(top_15)}")
+        print(f"✅ Отслеживаем: {', '.join(top_15)}")
         return top_15
     except Exception as e:
-        print(f"⚠️ Ошибка при получении ТОП монет: {e}. Откат к резервному списку.")
+        print(f"⚠️ Ошибка при получении ТОП монет: {e}. Используем базовый список.")
         return [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
             "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT",
             "NEARUSDT", "DOTUSDT", "LTCUSDT", "APTUSDT", "PEPEUSDT"
         ]
 
-# --- 3. HEALTH CHECK СЕРВЕР ДЛЯ RENDER ---
-async def handle_health_check(request):
-    return web.Response(text="Judas Async Screener is Running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"🌐 Health-check сервер запущен на порту {PORT}")
-
-# --- 4. АСИНХРОННАЯ ЗАГРУЗКА ДАННЫХ И ОТРИСОВКА ГРАФИКА ---
+# --- 3. ЗАГРУЗКА ДАННЫХ И ОТРИСОВКА ГРАФИКА ---
 def generate_chart_sync(symbol: str, dataframe: pd.DataFrame) -> str:
-    """Синхронный рендеринг PNG-графика через mplfinance (CPU-bound)"""
     clean_symbol = symbol.replace('/', '_').replace(':', '')
     image_path = f"chart_{clean_symbol}.png"
     
@@ -89,21 +82,17 @@ def generate_chart_sync(symbol: str, dataframe: pd.DataFrame) -> str:
     return image_path
 
 async def fetch_and_draw_chart_async(exchange: ccxt_async.binance, symbol: str) -> str:
-    """Асинхронно фетчит OHLCV и запускает генерацию графика в отдельном потоке"""
     ccxt_symbol = f"{symbol[:-4]}/USDT" if symbol.endswith("USDT") else symbol
-    
     ohlcv = await exchange.fetch_ohlcv(ccxt_symbol, timeframe="15m", limit=40)
     
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
 
-    image_path = await asyncio.to_thread(generate_chart_sync, symbol, df)
-    return image_path
+    return await asyncio.to_thread(generate_chart_sync, symbol, df)
 
-# --- 5. AGENT 1: GEMINI FLASH (VISION) ---
+# --- 4. AGENT 1: GEMINI FLASH ---
 async def analyze_gemini_async(session: ClientSession, image_path: str) -> dict:
-    """Асинхронный анализ структуры SMC по графику через Gemini 1.5 Flash"""
     def read_image_b64(path):
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode('utf-8')
@@ -113,9 +102,8 @@ async def analyze_gemini_async(session: ClientSession, image_path: str) -> dict:
 
     prompt_text = (
         "Ты — SMC аналитик. Проанализируй свечной график на предмет сетапа Judas Swing. "
-        "Определи: 1) Свип ликвидности (тенью или телом). 2) Наличие импульсного движения (Displacement). "
-        "3) Наличие CHOCH и свежего FVG. "
-        "Верни СТРОГО JSON без markdown символов и без ```json: "
+        "Определи: 1) Свип ликвидности. 2) Displacement. 3) CHOCH и свежий FVG. "
+        "Верни СТРОГО JSON без markdown: "
         '{"sweep_quality": "HIGH", "displacement": true, "choch_detected": true, "fvg_detected": true, "comment": "краткое описание"}'
     )
 
@@ -135,13 +123,12 @@ async def analyze_gemini_async(session: ClientSession, image_path: str) -> dict:
             clean_json = raw_text.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_json)
     except Exception as e:
-        print(f"❌ Ошибка запроса к Gemini Flash: {e}")
+        print(f"❌ Ошибка Gemini: {e}")
         return {"sweep_quality": "LOW", "displacement": False, "comment": f"Ошибка AI: {e}"}
 
-# --- 6. AGENT 2: GROQ LLAMA 3.3 (RISK MANAGER) ---
-async def analyze_groq_async(session: ClientSession, vision_json: dict, risk_reward: float = 3.5, candles_closed_outside: int = 0) -> dict:
-    """Асинхронная проверка риска и валидация сетапа через Groq Llama 3.3"""
-    url = "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)"
+# --- 5. AGENT 2: GROQ LLAMA 3.3 ---
+async def analyze_groq_async(session: ClientSession, vision_json: dict) -> dict:
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -149,24 +136,15 @@ async def analyze_groq_async(session: ClientSession, vision_json: dict, risk_rew
 
     system_prompt = (
         "Ты — Главный Риск-Менеджер сетапа Judas Swing. "
-        "Правила отбраковки: "
-        "1. Если candles_closed_outside >= 2 — REJECT. "
-        "2. Требуется R:R >= 1:3. "
-        "3. Должны присутствовать CHOCH и FVG. "
-        "Верни СТРОГО JSON вида: {\"verdict\": \"EXECUTE\" или \"REJECT\", \"reasons\": [\"причина1\", \"причина2\"]}"
+        "Правила: Требуется R:R >= 1:3, наличие CHOCH и FVG. "
+        "Верни СТРОГО JSON: {\"verdict\": \"EXECUTE\" или \"REJECT\", \"reasons\": [\"причина\"]}"
     )
-
-    user_payload = {
-        "vision_metrics": vision_json,
-        "risk_reward": risk_reward,
-        "candles_closed_outside": candles_closed_outside
-    }
 
     data = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload)}
+            {"role": "user", "content": json.dumps({"vision_metrics": vision_json})}
         ],
         "response_format": {"type": "json_object"}
     }
@@ -174,15 +152,13 @@ async def analyze_groq_async(session: ClientSession, vision_json: dict, risk_rew
     try:
         async with session.post(url, headers=headers, json=data, timeout=30) as resp:
             res_json = await resp.json()
-            content = res_json['choices'][0]['message']['content']
-            return json.loads(content)
+            return json.loads(res_json['choices'][0]['message']['content'])
     except Exception as e:
-        print(f"❌ Ошибка запроса к Groq: {e}")
+        print(f"❌ Ошибка Groq: {e}")
         return {"verdict": "REJECT", "reasons": [f"Ошибка API Groq: {e}"]}
 
-# --- 7. TELEGRAM SENDER ---
+# --- 6. TELEGRAM SENDER ---
 async def send_telegram_async(session: ClientSession, symbol: str, vision_data: dict, final_verdict: dict, image_path: str):
-    """Асинхронная отправка фото с описанием в Telegram"""
     caption = (
         f"🚨 **СИГНАЛ JUDAS SWING: {symbol}**\n\n"
         f"📍 **Вердикт:** `{final_verdict.get('verdict')}`\n"
@@ -192,8 +168,7 @@ async def send_telegram_async(session: ClientSession, symbol: str, vision_data: 
         f"🛡 **Причины решения:** {', '.join(final_verdict.get('reasons', []))}\n"
     )
 
-    url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_BOT_TOKEN}/sendPhoto"
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     data = FormData()
     data.add_field('chat_id', TELEGRAM_CHAT_ID)
     data.add_field('caption', caption)
@@ -205,93 +180,63 @@ async def send_telegram_async(session: ClientSession, symbol: str, vision_data: 
     try:
         async with session.post(url, data=data, timeout=30) as resp:
             if resp.status == 200:
-                print(f"🟢 [{symbol}] Алерт успешно отправлен в Telegram!")
-            else:
-                err_text = await resp.text()
-                print(f"❌ Ошибка отправки в Telegram [{resp.status}]: {err_text}")
+                print(f"🟢 [{symbol}] Алерт отправлен в Telegram!")
     except Exception as e:
-        print(f"❌ Исключение при отправке в Telegram: {e}")
+        print(f"❌ Ошибка Telegram: {e}")
 
-# --- 8. ОБРАБОТЧИК СОБЫТИЯ ЗАКРЫТИЯ СВЕЧИ ---
+# --- 7. ОБРАБОТЧИК ЗАКРЫТИЯ СВЕЧИ ---
 async def process_candle_event(session: ClientSession, exchange: ccxt_async.binance, symbol: str):
-    """Параллельно вызываемый пайплайн анализа конкретной монеты"""
-    print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Свеча 15m закрылась по {symbol}. Старт анализа...")
-    
+    print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Свеча 15m закрылась по {symbol}. Анализируем...")
     image_path = None
     try:
         image_path = await fetch_and_draw_chart_async(exchange, symbol)
-
         vision_res = await analyze_gemini_async(session, image_path)
-        print(f"[{symbol}] Gemini Flash: {vision_res}")
 
         if vision_res.get("sweep_quality") in ["HIGH", "MEDIUM"]:
             final_decision = await analyze_groq_async(session, vision_res)
-            print(f"[{symbol}] Groq Llama 3.3: {final_decision}")
-
             if final_decision.get("verdict") == "EXECUTE":
                 await send_telegram_async(session, symbol, vision_res, final_decision, image_path)
-            else:
-                print(f"⚪ [{symbol}] Сетап отбракован Риск-Менеджером.")
-        else:
-            print(f"⚪ [{symbol}] Низкое качество свипа ({vision_res.get('sweep_quality')}). Пропуск Groq.")
-
     except Exception as e:
-        print(f"❌ Ошибка при обработке пайплайна {symbol}: {e}")
+        print(f"❌ Ошибка обработки {symbol}: {e}")
     finally:
         if image_path and os.path.exists(image_path):
-            try:
-                os.remove(image_path)
-            except OSError:
-                pass
+            os.remove(image_path)
 
-# --- 9. WEBSOCKET СЛУШАТЕЛЬ С ДИНАМИЧЕСКИМ ТОП-15 ---
+# --- 8. WEBSOCKET СЛУШАТЕЛЬ С ОГРАНИЧЕНИЕМ ПО ВРЕМЕНИ ---
 async def binance_websocket_listener(session: ClientSession, exchange: ccxt_async.binance):
-    while True:
-        # Получаем актуальный ТОП-15 перед подключением/переподключением
-        symbols = await get_top_15_symbols(exchange)
-        stream_names = "/".join([f"{s.lower()}@kline_15m" for s in symbols])
-        ws_url = f"wss://[stream.binance.com:9443/ws/](https://stream.binance.com:9443/ws/){stream_names}"
+    symbols = await get_top_15_symbols(exchange)
+    stream_names = "/".join([f"{s.lower()}@kline_15m" for s in symbols])
+    ws_url = f"wss://stream.binance.com:9443/ws/{stream_names}"
 
+    start_time = datetime.now()
+    end_time = start_time + timedelta(seconds=WORK_DURATION_SECONDS)
+
+    print(f"⏰ Запуск сканирования на 3 часа (до {end_time.strftime('%H:%M:%S')})...")
+
+    while datetime.now() < end_time:
         try:
-            print(f"🔗 Подключение к Binance WebSocket Stream для {len(symbols)} монет...")
-            async with websockets.connect(
-                ws_url,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=10
-            ) as ws:
-                print("✅ WebSocket подключен. Мониторинг закрытия 15m свечей 24/7...")
-                
-                # Таймер для перерасчета ТОП-15 монет каждые 6 часов
-                last_top_update = datetime.now()
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+                print("✅ WebSocket подключен. Слушаем 15m свечи...")
+                while datetime.now() < end_time:
+                    try:
+                        # Таймаут 1 секунда, чтобы регулярно проверять condition времени (end_time)
+                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        data = json.loads(msg)
 
-                while True:
-                    # Раз в 6 часов переподключаемся, чтобы обновить ТОП-15 пар
-                    if (datetime.now() - last_top_update).total_seconds() > 21600:
-                        print("🔄 Прошло 6 часов, переподключение для обновления ТОП-15 монет...")
-                        break
+                        if data.get('e') == 'kline' and data['k'].get('x'):
+                            asyncio.create_task(process_candle_event(session, exchange, data['s']))
+                    except asyncio.TimeoutError:
+                        continue
+        except Exception as e:
+            if datetime.now() < end_time:
+                print(f"⚠️ Ошибка сети: {e}. Переподключение...")
+                await asyncio.sleep(5)
 
-                    msg = await ws.recv()
-                    data = json.loads(msg)
+    print("🏁 3 часа работы истекли. Завершаем работу сессии GitHub Actions.")
 
-                    if data.get('e') == 'kline':
-                        kline = data['k']
-                        if kline.get('x'):  # Закрытие 15m свечи
-                            symbol = data['s']
-                            asyncio.create_task(process_candle_event(session, exchange, symbol))
-
-        except (websockets.ConnectionClosed, websockets.WebSocketException, Exception) as e:
-            print(f"⚠️ Ошибка WebSocket: {e}. Переподключение через 5 секунд...")
-            await asyncio.sleep(5)
-
-# --- 10. ГЛАВНАЯ ТОЧКА ВХОДА ---
+# --- 9. ТОЧКА ВХОДА ---
 async def main():
-    print("🚀 Запуск асинхронного воркера Judas Screener (Динамический ТОП-15, Режим 24/7)...")
-
-    await start_web_server()
-
     exchange = ccxt_async.binance({'enableRateLimit': True})
-    
     async with ClientSession() as session:
         try:
             await binance_websocket_listener(session, exchange)
@@ -299,7 +244,4 @@ async def main():
             await exchange.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("🛑 Воркер остановлен вручную.")
+    asyncio.run(main())
