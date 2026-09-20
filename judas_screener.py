@@ -280,15 +280,4 @@ async def main():
             await exchange.close()
 
 if __name__ == "__main__":
-    async def test_pipeline():
-        print("🧪 ТЕСТОВЫЙ ЗАПУСК (Проверка Gemini + Groq + Telegram)...")
-        exchange = ccxt_async.bybit({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
-        
-        async with ClientSession() as session:
-            # Принудительно анализируем BTCUSDT прямо сейчас
-            await process_candle_event(session, exchange, "BTCUSDT")
-            
-        await exchange.close()
-        print("✅ Тест завершен! Проверьте логи и ваш Telegram.")
-
-    asyncio.run(test_pipeline())
+    asyncio.run(main())
