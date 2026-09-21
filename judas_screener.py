@@ -31,45 +31,41 @@ if missing_keys:
 # Время работы скрипта (3 часа = 10800 секунд)
 WORK_DURATION_SECONDS = 3 * 3600
 
-# --- 2. ПОЛУЧЕНИЕ ТОП-15 МОНЕТ (BYBIT) ---
-async def get_top_15_symbols(exchange: ccxt_async.bybit) -> list:
-    """Загружает ТОП-15 монет по суточному объему торгов с Bybit"""
+# --- 2. ПОЛУЧЕНИЕ ТОП-15 МОНЕТ (COINCAP API) ---
+async def get_top_15_symbols(exchange: ccxt_async.bybit = None) -> list:
+    """Динамически получает ТОП-15 монет по капитализации и объему через открытый API CoinCap"""
+    print("🔍 Динамическая загрузка ТОП-15 монет по рынку (CoinCap)...")
+    url = "https://api.coincap.io/v2/assets?limit=30"
+    stables_and_wraps = {'USDC', 'USDT', 'FDUSD', 'DAI', 'TUSD', 'WBTC', 'WBETH', 'USDE', 'STETH'}
+
     try:
-        print("🔍 Загрузка ТОП-15 монет по суточному объему (Bybit)...")
-        tickers = await exchange.fetch_tickers()
-        stables_and_wraps = {'USDC', 'USDT', 'FDUSD', 'DAI', 'TUSD', 'WBTC', 'WBETH', 'USDE'}
-
-        candidates = []
-        for symbol, ticker in tickers.items():
-            if not symbol.endswith('/USDT'):
-                continue
-
-            base = symbol.split('/')[0]
-            if base in stables_and_wraps:
-                continue
-
-            quote_volume = ticker.get('quoteVolume', 0)
-            if not quote_volume and ticker.get('baseVolume') and ticker.get('last'):
-                quote_volume = ticker['baseVolume'] * ticker['last']
-
-            if quote_volume and quote_volume > 0:
-                clean_symbol = symbol.replace('/', '').split(':')[0]
-                candidates.append({
-                    'symbol': clean_symbol,
-                    'volume': quote_volume
-                })
-
-        sorted_candidates = sorted(candidates, key=lambda x: x['volume'], reverse=True)
-        top_15 = [c['symbol'] for c in sorted_candidates[:15]]
-        print(f"✅ Отслеживаем (Bybit): {', '.join(top_15)}")
-        return top_15
+        async with ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    top_symbols = []
+                    
+                    for item in data.get('data', []):
+                        symbol = item.get('symbol', '').upper()
+                        if symbol in stables_and_wraps:
+                            continue
+                        
+                        top_symbols.append(f"{symbol}USDT")
+                        if len(top_symbols) == 15:
+                            break
+                    
+                    if top_symbols:
+                        print(f"✅ Динамический ТОП-15 загружен: {', '.join(top_symbols)}")
+                        return top_symbols
     except Exception as e:
-        print(f"⚠️ Ошибка при получении ТОП монет Bybit: {e}. Используем базовый список.")
-        return [
-            "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-            "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT",
-            "NEARUSDT", "DOTUSDT", "LTCUSDT", "APTUSDT", "PEPEUSDT"
-        ]
+        print(f"⚠️ Ошибка загрузки рейтинга через CoinCap API: {e}. Используем базовый список.")
+
+    # Резервный список на случай сбоя сети
+    return [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT",
+        "NEARUSDT", "DOTUSDT", "LTCUSDT", "APTUSDT", "PEPEUSDT"
+    ]
 
 # --- 3. ГЕНЕРАЦИЯ ГРАФИКА ---
 def generate_chart_sync(symbol: str, dataframe: pd.DataFrame) -> str:
