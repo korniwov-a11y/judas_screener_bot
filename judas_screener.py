@@ -31,11 +31,11 @@ if missing_keys:
 # Время работы скрипта (3 часа = 10800 секунд)
 WORK_DURATION_SECONDS = 3 * 3600
 
-# --- 2. ПОЛУЧЕНИЕ ТОП-15 МОНЕТ (COINCAP API) ---
+# --- 2. ПОЛУЧЕНИЕ ТОП-15 МОНЕТ (CRYPTOCOMPARE API) ---
 async def get_top_15_symbols(exchange: ccxt_async.bybit = None) -> list:
-    """Динамически получает ТОП-15 монет по капитализации и объему через открытый API CoinCap"""
-    print("🔍 Динамическая загрузка ТОП-15 монет по рынку (CoinCap)...")
-    url = "https://api.coincap.io/v2/assets?limit=30"
+    """Динамически получает ТОП-15 монет по капитализации/объему (без блоков 403 и 451 на GitHub Actions)"""
+    print("🔍 Динамическая загрузка ТОП-15 монет по рынку (CryptoCompare)...")
+    url = "https://min-api.cryptocompare.com/data/top/mktcapfull?limit=30&tsym=USD"
     stables_and_wraps = {'USDC', 'USDT', 'FDUSD', 'DAI', 'TUSD', 'WBTC', 'WBETH', 'USDE', 'STETH'}
 
     try:
@@ -45,9 +45,11 @@ async def get_top_15_symbols(exchange: ccxt_async.bybit = None) -> list:
                     data = await resp.json()
                     top_symbols = []
                     
-                    for item in data.get('data', []):
-                        symbol = item.get('symbol', '').upper()
-                        if symbol in stables_and_wraps:
+                    for item in data.get('Data', []):
+                        coin_info = item.get('CoinInfo', {})
+                        symbol = coin_info.get('Name', '').upper()
+                        
+                        if not symbol or symbol in stables_and_wraps:
                             continue
                         
                         top_symbols.append(f"{symbol}USDT")
@@ -58,7 +60,7 @@ async def get_top_15_symbols(exchange: ccxt_async.bybit = None) -> list:
                         print(f"✅ Динамический ТОП-15 загружен: {', '.join(top_symbols)}")
                         return top_symbols
     except Exception as e:
-        print(f"⚠️ Ошибка загрузки рейтинга через CoinCap API: {e}. Используем базовый список.")
+        print(f"⚠️ Ошибка загрузки рейтинга через CryptoCompare API: {e}. Используем базовый список.")
 
     # Резервный список на случай сбоя сети
     return [
