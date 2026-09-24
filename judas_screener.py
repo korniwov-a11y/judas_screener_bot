@@ -1,6 +1,7 @@
 import asyncio
 import base64
 from datetime import datetime, timedelta, timezone
+import html
 import json
 import os
 from aiohttp import ClientSession, FormData
@@ -185,7 +186,7 @@ async def fetch_htf_context_async(
         else "BEARISH"
     )
 
-    # 4H POI по ЗАКРЫТЫМ свечам
+    # 4H POI по ЗАКРЫТЫМ свечам (отсекаем незакрытую свечу)
     ohlcv_4h = await exchange.fetch_ohlcv(
         ccxt_symbol, timeframe="4h", limit=40
     )
@@ -325,8 +326,9 @@ async def check_smt_divergence_async(
         paired_symbol = (
             "ETH/USDT" if "BTC" in main_symbol.upper() else "BTC/USDT"
         )
+        # Использование limit=120 для достаточного диапазона свечей
         ohlcv_pair = await exchange.fetch_ohlcv(
-            paired_symbol, timeframe="15m", limit=40
+            paired_symbol, timeframe="15m", limit=120
         )
         df_pair = pd.DataFrame(
             ohlcv_pair,
@@ -337,6 +339,8 @@ async def check_smt_divergence_async(
             .dt.tz_localize("UTC")
             .dt.tz_convert(timezone(timedelta(hours=3)))
         )
+        # Отсекаем текущую незакрытую свечу
+        df_pair = df_pair.iloc[:-1].copy()
 
         now_utc3 = datetime.now(timezone(timedelta(hours=3)))
         asian_pair = df_pair[
@@ -384,7 +388,7 @@ async def analyze_gemini_async(
         "1. Оцени качество свипа (тенью или возвратом).\n"
         "2. Проверь наличие Displacement и CHOCH.\n"
         "3. Найди FVG для лимитного ордера.\n"
-        "Верни СТРОГО JSON без markdown:\n"
+        "Верни СТРОГО JSON без дополнительных пояснений:\n"
         '{"sweep_quality": "HIGH"|"MEDIUM"|"LOW", "displacement": true, "choch_detected": true, "fvg_detected": true, "comment": "текст"}'
     )
 
@@ -401,15 +405,17 @@ async def analyze_gemini_async(
                     },
                 ]
             }
-        ]
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
     }
 
     try:
         async with session.post(url, json=payload, timeout=30) as resp:
             resp_data = await resp.json()
             raw_text = resp_data["candidates"][0]["content"]["parts"][0]["text"]
-            clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean_json)
+            return json.loads(raw_text)
     except Exception as e:
         print(f"❌ Ошибка Gemini: {e}")
         return {
@@ -439,7 +445,7 @@ async def analyze_groq_async(
         "   - entry_range: диапазон цен для лимитного входа (по зоне FVG/OB), например '64200.0 - 64450.0'\n"
         "   - sl: точный уровень Stop Loss (за уровень свипа)\n"
         "   - tp: точный уровень Take Profit\n\n"
-        "Верни СТРОГО JSON без markdown:\n"
+        "Верни СТРОГО JSON:\n"
         '{"verdict": "EXECUTE"|"REJECT", "entry_range": "мин_цена - макс_цена", "sl": 0.0, "tp": 0.0, "rr": "1:3.5", "reasons": "описание"}'
     )
 
@@ -447,6 +453,7 @@ async def analyze_groq_async(
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
+        "response_format": {"type": "json_object"}
     }
 
     try:
@@ -455,8 +462,7 @@ async def analyze_groq_async(
         ) as resp:
             res_json = await resp.json()
             raw_text = res_json["choices"][0]["message"]["content"]
-            clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean_json)
+            return json.loads(raw_text)
     except Exception as e:
         print(f"❌ Ошибка Groq: {e}")
         return {"verdict": "REJECT", "reasons": f"Ошибка API Groq: {e}"}
@@ -471,30 +477,30 @@ async def send_telegram_async(
     image_path: str,
 ):
     caption = (
-        f"🚨 **СИГНАЛ JUDAS SWING: {symbol}**\n\n"
-        f"📍 **Вердикт:** `{groq_data.get('verdict')}`\n"
-        f"📊 **Качество свипа:** {vision_data.get('sweep_quality')}\n"
-        f"⚡ **Displacement / CHOCH / FVG:** {vision_data.get('displacement')} / {vision_data.get('choch_detected')} / {vision_data.get('fvg_detected')}\n\n"
+        f"🚨 <b>СИГНАЛ JUDAS SWING: {html.escape(symbol)}</b>\n\n"
+        f"📍 <b>Вердикт:</b> <code>{html.escape(str(groq_data.get('verdict')))}</code>\n"
+        f"📊 <b>Качество свипа:</b> {html.escape(str(vision_data.get('sweep_quality')))}\n"
+        f"⚡ <b>Displacement / CHOCH / FVG:</b> {vision_data.get('displacement')} / {vision_data.get('choch_detected')} / {vision_data.get('fvg_detected')}\n\n"
     )
 
     if groq_data.get("verdict") == "EXECUTE":
         caption += (
-            f"🎯 **Диапазон входа (Entry):** `{groq_data.get('entry_range')}`\n"
-            f"🛑 **Стоп-лосс (SL):** `{groq_data.get('sl')}`\n"
-            f"🏆 **Тейк-профит (TP):** `{groq_data.get('tp')}`\n"
-            f"📐 **Соотношение R:R:** `{groq_data.get('rr')}`\n\n"
+            f"🎯 <b>Диапазон входа (Entry):</b> <code>{html.escape(str(groq_data.get('entry_range')))}</code>\n"
+            f"🛑 <b>Стоп-лосс (SL):</b> <code>{html.escape(str(groq_data.get('sl')))}</code>\n"
+            f"🏆 <b>Тейк-профит (TP):</b> <code>{html.escape(str(groq_data.get('tp')))}</code>\n"
+            f"📐 <b>Соотношение R:R:</b> <code>{html.escape(str(groq_data.get('rr')))}</code>\n\n"
         )
 
     caption += (
-        f"📝 **Анализ:** {vision_data.get('comment')}\n"
-        f"🛡 **Риск-менеджмент:** {groq_data.get('reasons')}"
+        f"📝 <b>Анализ:</b> {html.escape(str(vision_data.get('comment', '')))}\n"
+        f"🛡 <b>Риск-менеджмент:</b> {html.escape(str(groq_data.get('reasons', '')))}"
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     data = FormData()
     data.add_field("chat_id", TELEGRAM_CHAT_ID)
     data.add_field("caption", caption)
-    data.add_field("parse_mode", "Markdown")
+    data.add_field("parse_mode", "HTML")
 
     with open(image_path, "rb") as f:
         data.add_field(
@@ -522,8 +528,9 @@ async def process_candle_event(
     image_path = None
     try:
         ccxt_symbol = to_ccxt_symbol(symbol)
+        # Загружаем 120 свечей для корректного перекрытия Азиатской сессии
         ohlcv = await exchange.fetch_ohlcv(
-            ccxt_symbol, timeframe="15m", limit=50
+            ccxt_symbol, timeframe="15m", limit=120
         )
         df_15m = pd.DataFrame(
             ohlcv,
@@ -531,6 +538,9 @@ async def process_candle_event(
         )
         df_15m["timestamp"] = pd.to_datetime(df_15m["timestamp"], unit="ms")
         df_15m.set_index("timestamp", inplace=True)
+
+        # Отсекаем текущую незакрытую свечу, чтобы работать строго с закрытыми данными
+        df_15m = df_15m.iloc[:-1].copy()
 
         # 1. Проверка Killzone, ширины Азии и Expansion
         asian_check = analyze_asian_range_and_disqualification(df_15m)
@@ -577,7 +587,7 @@ async def process_candle_event(
             f"🎯 [{symbol}] Все математические условия выполнены! Вызываем ИИ-агенты..."
         )
 
-        # 6. Генерация графика и вызов ИИ-агентов
+        # 6. Генерация графика и вызов ИИ-агентов (отрисовываем последние 40 закрытых свечей)
         image_path = await asyncio.to_thread(
             generate_chart_sync, symbol, df_15m.tail(40)
         )
@@ -653,7 +663,8 @@ async def bybit_websocket_listener(
 
                 try:
                     while datetime.now() < end_time:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        # Таймаут увеличен до 30.0 секунд для снижения лишней нагрузки на CPU
+                        msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
                         data = json.loads(msg)
 
                         if "topic" in data and data["topic"].startswith(
