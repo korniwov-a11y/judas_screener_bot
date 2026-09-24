@@ -263,17 +263,14 @@ async def bybit_websocket_listener(session: ClientSession, exchange: ccxt_async.
 
     print("🏁 3 часа работы истекли. Завершаем работу сессии GitHub Actions.")
 
-# --- 9. ТОЧКА ВХОДА ---
+# --- 9. ТОЧКА ВХОДА ДЛЯ МГНОВЕННОГО ТЕСТА СВЯЗИ ---
 async def main():
-    exchange = ccxt_async.bybit({
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot',
-        }
-    })
+    exchange = ccxt_async.bybit({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
     async with ClientSession() as session:
         try:
-            await bybit_websocket_listener(session, exchange)
+            print("🧪 Запуск мгновенного теста отправки в Telegram...")
+            # Принудительно запускаем анализ BTCUSDT прямо при старте:
+            await process_candle_event(session, exchange, "BTCUSDT")
         finally:
             await exchange.close()
 
