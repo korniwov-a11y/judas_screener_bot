@@ -263,16 +263,19 @@ async def bybit_websocket_listener(session: ClientSession, exchange: ccxt_async.
 
     print("🏁 3 часа работы истекли. Завершаем работу сессии GitHub Actions.")
 
-# --- 9. ТОЧКА ВХОДА (ПРЯМОЙ ТЕСТ TELEGRAM) ---
+# --- 9. ТОЧКА ВХОДА ---
 async def main():
+    exchange = ccxt_async.bybit({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',
+        }
+    })
     async with ClientSession() as session:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "🔔 Тест связи! Скрипт успешно подключился к Telegram."}
-        async with session.post(url, json=payload) as resp:
-            if resp.status == 200:
-                print("🟢 Успешно! Проверьте Telegram.")
-            else:
-                print(f"❌ Ошибка Telegram API: {resp.status} - {await resp.text()}")
+        try:
+            await bybit_websocket_listener(session, exchange)
+        finally:
+            await exchange.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
