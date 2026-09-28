@@ -251,7 +251,7 @@ async def fetch_htf_context_async(
 
 
 def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame) -> dict:
-    """Проверяет London Killzone (08:00–11:00 UTC+3), ширину Азиатского боковика (<= 2%) и правила Expansion."""
+    """Проверяет London Killzone (09:00–12:00 UTC+3), ширину Азиатского боковика (<= 2%) и правила Expansion."""
     df = df_15m.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
@@ -263,19 +263,19 @@ def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame) -> dict:
     df["time_utc3"] = df.index.tz_convert(tz_utc3)
     now_utc3 = datetime.now(tz_utc3)
 
-    # 1. London Killzone (08:00–11:00 UTC+3)
-    if not (8 <= now_utc3.hour < 11):
+    # 1. London Killzone (09:00–12:00 UTC+3)
+    if not (9 <= now_utc3.hour < 12):
         return {
             "valid": False,
             "reason": f"Вне окна London Killzone (сейчас {now_utc3.strftime('%H:%M')} UTC+3)",
         }
 
-    # 2. Asian Range (00:00 - 08:00 UTC+3)
+    # 2. Asian Range (00:00 - 09:00 UTC+3)
     today = now_utc3.date()
     asian_df = df[
         (df["time_utc3"].dt.date == today)
         & (df["time_utc3"].dt.hour >= 0)
-        & (df["time_utc3"].dt.hour < 8)
+        & (df["time_utc3"].dt.hour < 9)
     ]
 
     if len(asian_df) < 8:
@@ -346,7 +346,7 @@ async def check_smt_divergence_async(
         asian_pair = df_pair[
             (df_pair["timestamp"].dt.date == now_utc3.date())
             & (df_pair["timestamp"].dt.hour >= 0)
-            & (df_pair["timestamp"].dt.hour < 8)
+            & (df_pair["timestamp"].dt.hour < 9)
         ]
 
         if asian_pair.empty:
