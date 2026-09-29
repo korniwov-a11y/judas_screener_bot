@@ -44,32 +44,35 @@ def to_ccxt_symbol(symbol: str) -> str:
     return symbol
 
 
-# --- 2. ПОЛУЧЕНИЕ ТОП-15 МОНЕТ (CRYPTOCOMPARE API) ---
-async def get_top_15_symbols(exchange: ccxt_async.bybit = None) -> list:
-    """Динамически получает ТОП-15 монет по капитализации/объему."""
-    print("🔍 Динамическая загрузка ТОП-15 монет по рынку (CryptoCompare)...")
-    url = (
-        "https://min-api.cryptocompare.com/data/top/mktcapfull?limit=30&tsym=USD"
-    )
+# --- 2. ПОЛУЧЕНИЕ ТОП-100 МОНЕТ (CRYPTOCOMPARE API) ---
+async def get_top_100_symbols(exchange: ccxt_async.bybit = None) -> list:
+    """Динамически получает ТОП-100 монет по капитализации/объему."""
+    print("🔍 Динамическая загрузка ТОП-100 монет по рынку (CryptoCompare)...")
+    
+    # Расширенный список стейблкоинов, обернутых и ликвидных токенов
     stables_and_wraps = {
-        "USDC",
-        "USDT",
-        "FDUSD",
-        "DAI",
-        "TUSD",
-        "WBTC",
-        "WBETH",
-        "USDE",
-        "STETH",
+        "USDC", "USDT", "FDUSD", "DAI", "TUSD", "WBTC", "WBETH", "USDE", 
+        "STETH", "WEETH", "RETH", "CBETH", "BUSD", "USDD", "PYUSD", "FRAX",
+        "LUSD", "GUSD", "USDS", "CRVUSD"
     }
+
+    top_symbols = []
 
     try:
         async with ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
+            # Делаем запрос к 2 страницам (по 100 монет), чтобы гарантированно
+            # набрать 100 валидных монет после фильтрации стейблкоинов
+            for page in range(2):
+                url = (
+                    f"https://min-api.cryptocompare.com/data/top/mktcapfull"
+                    f"?limit=100&page={page}&tsym=USD"
+                )
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status != 200:
+                        continue
+                    
                     data = await resp.json()
-                    top_symbols = []
-
+                    
                     for item in data.get("Data", []):
                         coin_info = item.get("CoinInfo", {})
                         symbol = coin_info.get("Name", "").upper()
@@ -78,37 +81,33 @@ async def get_top_15_symbols(exchange: ccxt_async.bybit = None) -> list:
                             continue
 
                         top_symbols.append(f"{symbol}USDT")
-                        if len(top_symbols) == 15:
+                        if len(top_symbols) == 100:
                             break
+                
+                if len(top_symbols) == 100:
+                    break
 
-                    if top_symbols:
-                        print(
-                            f"✅ Динамический ТОП-15 загружен: {', '.join(top_symbols)}"
-                        )
-                        return top_symbols
+            if top_symbols:
+                print(
+                    f"✅ Динамический ТОП-100 загружен ({len(top_symbols)} монет). "
+                    f"Первые 5: {', '.join(top_symbols[:5])}..."
+                )
+                return top_symbols
+
     except Exception as e:
         print(
-            f"⚠️ Ошибка загрузки рейтинга через CryptoCompare API: {e}. Используем базовый список."
+            f"⚠️ Ошибка загрузки рейтинга через CryptoCompare API: {e}. "
+            f"Используем базовый резервный список."
         )
 
+    # Резервный список на случай падения API (расширен до актуального топ-набора)
     return [
-        "BTCUSDT",
-        "ETHUSDT",
-        "SOLUSDT",
-        "BNBUSDT",
-        "XRPUSDT",
-        "DOGEUSDT",
-        "ADAUSDT",
-        "AVAXUSDT",
-        "SUIUSDT",
-        "LINKUSDT",
-        "NEARUSDT",
-        "DOTUSDT",
-        "LTCUSDT",
-        "APTUSDT",
-        "PEPEUSDT",
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", 
+        "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT", "NEARUSDT", "DOTUSDT", 
+        "LTCUSDT", "APTUSDT", "PEPEUSDT", "SHIBUSDT", "TRXUSDT", "BCHUSDT", 
+        "UNIUSDT", "NEARUSDT", "FETUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", 
+        "RENDERUSDT", "TAOUSDT", "AAVEUSDT", "INJUSDT", "TIAUSDT", "STXUSDT"
     ]
-
 
 # --- 3. ГЕНЕРАЦИЯ ГРАФИКА ---
 def generate_chart_sync(symbol: str, df_40: pd.DataFrame) -> str:
