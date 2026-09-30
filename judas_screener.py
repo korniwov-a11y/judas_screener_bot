@@ -640,7 +640,7 @@ async def send_bybit_ping(ws, end_time):
 async def bybit_websocket_listener(
     session: ClientSession, exchange: ccxt_async.bybit
 ):
-   symbols = await get_top_100_symbols(exchange)
+    symbols = await get_top_100_symbols(exchange)
     ws_url = "wss://stream.bybit.com/v5/public/spot"
 
     start_time = datetime.now()
