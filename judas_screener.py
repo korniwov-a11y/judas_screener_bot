@@ -44,25 +44,25 @@ def to_ccxt_symbol(symbol: str) -> str:
     return symbol
 
 
-# --- 2. ПОЛУЧЕНИЕ ТОП-100 МОНЕТ (CRYPTOCOMPARE API) ---
-async def get_top_100_symbols(exchange: ccxt_async.bybit = None) -> list:
-    """Динамически получает ТОП-100 монет по капитализации/объему."""
-    print("🔍 Динамическая загрузка ТОП-100 монет по рынку (CryptoCompare)...")
-    
+# --- 2. ПОЛУЧЕНИЕ ТОП-200 МОНЕТ (CRYPTOCOMPARE API) ---
+async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
+    """Динамически получает ТОП-200 монет по капитализации/объему."""
+    print("🔍 Динамическая загрузка ТОП-200 монет по рынку (CryptoCompare)...")
+
     # Расширенный список стейблкоинов, обернутых и ликвидных токенов
     stables_and_wraps = {
-        "USDC", "USDT", "FDUSD", "DAI", "TUSD", "WBTC", "WBETH", "USDE", 
+        "USDC", "USDT", "FDUSD", "DAI", "TUSD", "WBTC", "WBETH", "USDE",
         "STETH", "WEETH", "RETH", "CBETH", "BUSD", "USDD", "PYUSD", "FRAX",
-        "LUSD", "GUSD", "USDS", "CRVUSD"
+        "LUSD", "GUSD", "USDS", "CRVUSD", "SUSD", "USDP", "USDJ"
     }
 
     top_symbols = []
 
     try:
         async with ClientSession() as session:
-            # Делаем запрос к 2 страницам (по 100 монет), чтобы гарантированно
-            # набрать 100 валидных монет после фильтрации стейблкоинов
-            for page in range(2):
+            # Запрашиваем 3 страницы по 100 монет (всего 300 элементов),
+            # чтобы с запасом набрать 200 реальных альткоинов без стейблкоинов
+            for page in range(3):
                 url = (
                     f"https://min-api.cryptocompare.com/data/top/mktcapfull"
                     f"?limit=100&page={page}&tsym=USD"
@@ -70,9 +70,9 @@ async def get_top_100_symbols(exchange: ccxt_async.bybit = None) -> list:
                 async with session.get(url, timeout=10) as resp:
                     if resp.status != 200:
                         continue
-                    
+
                     data = await resp.json()
-                    
+
                     for item in data.get("Data", []):
                         coin_info = item.get("CoinInfo", {})
                         symbol = coin_info.get("Name", "").upper()
@@ -81,15 +81,15 @@ async def get_top_100_symbols(exchange: ccxt_async.bybit = None) -> list:
                             continue
 
                         top_symbols.append(f"{symbol}USDT")
-                        if len(top_symbols) == 100:
+                        if len(top_symbols) == 200:
                             break
-                
-                if len(top_symbols) == 100:
+
+                if len(top_symbols) == 200:
                     break
 
             if top_symbols:
                 print(
-                    f"✅ Динамический ТОП-100 загружен ({len(top_symbols)} монет). "
+                    f"✅ Динамический ТОП-200 загружен ({len(top_symbols)} монет). "
                     f"Первые 5: {', '.join(top_symbols[:5])}..."
                 )
                 return top_symbols
@@ -100,15 +100,14 @@ async def get_top_100_symbols(exchange: ccxt_async.bybit = None) -> list:
             f"Используем базовый резервный список."
         )
 
-    # Резервный список на случай падения API (расширен до актуального топ-набора)
+    # Резервный список на случай падения API
     return [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", 
-        "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT", "NEARUSDT", "DOTUSDT", 
-        "LTCUSDT", "APTUSDT", "PEPEUSDT", "SHIBUSDT", "TRXUSDT", "BCHUSDT", 
-        "UNIUSDT", "NEARUSDT", "FETUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", 
-        "RENDERUSDT", "TAOUSDT", "AAVEUSDT", "INJUSDT", "TIAUSDT", "STXUSDT"
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT", "NEARUSDT", "DOTUSDT",
+        "LTCUSDT", "APTUSDT", "PEPEUSDT", "SHIBUSDT", "TRXUSDT", "BCHUSDT",
+        "UNIUSDT", "FETUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", "RENDERUSDT",
+        "TAOUSDT", "AAVEUSDT", "INJUSDT", "TIAUSDT", "STXUSDT", "FILUSDT"
     ]
-
 # --- 3. ГЕНЕРАЦИЯ ГРАФИКА ---
 def generate_chart_sync(symbol: str, df_40: pd.DataFrame) -> str:
     clean_symbol = symbol.replace("/", "_").replace(":", "")
@@ -640,7 +639,7 @@ async def send_bybit_ping(ws, end_time):
 async def bybit_websocket_listener(
     session: ClientSession, exchange: ccxt_async.bybit
 ):
-    symbols = await get_top_100_symbols(exchange)
+    symbols = await get_top_200_symbols(exchange)
     ws_url = "wss://stream.bybit.com/v5/public/spot"
 
     start_time = datetime.now()
