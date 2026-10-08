@@ -33,6 +33,7 @@ if missing_keys:
     )
 
 WORK_DURATION_SECONDS = 3 * 3600  # 3 часа
+CHOCH_TIMEOUT_MINUTES = 45  # Таймер для поиска CHOCH
 
 
 def to_ccxt_symbol(symbol: str) -> str:
@@ -42,6 +43,35 @@ def to_ccxt_symbol(symbol: str) -> str:
     if symbol.endswith("USDT"):
         return f"{symbol[:-4]}/USDT"
     return symbol
+
+
+def get_current_is_daylight_saving() -> bool:
+    """Определяет, находимся ли мы в летнем времени (EDT) или зимнем (EST)."""
+    now = datetime.now(timezone.utc)
+    # Хроническое определение: в США летнее время обычно с марта по ноябрь
+    # Упрощенно: если месяц в диапазоне 3-10 (март-октябрь), то EDT
+    return 3 <= now.month <= 10
+
+
+def get_london_killzone_window_utc() -> tuple[int, int]:
+    """
+    Возвращает корректное окно London Killzone в UTC с учетом сезонного сдвига.
+
+    Winter (EST / UTC-5): 07:00 - 10:00 UTC
+    Summer (EDT / UTC-4): 06:00 - 09:00 UTC
+    """
+    if get_current_is_daylight_saving():
+        return 6, 9  # EDT: 06:00 - 09:00 UTC
+    else:
+        return 7, 10  # EST: 07:00 - 10:00 UTC
+
+
+def get_london_killzone_window_utc3() -> tuple[int, int]:
+    """Возвращает окно London Killzone для UTC+3."""
+    utc_start, utc_end = get_london_killzone_window_utc()
+    utc3_start = (utc_start + 3) % 24
+    utc3_end = (utc_end + 3) % 24
+    return utc3_start, utc3_end
 
 
 # --- 2. ПОЛУЧЕНИЕ ТОП-200 МОНЕТ (CRYPTOCOMPARE API) ---
@@ -60,8 +90,6 @@ async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
 
     try:
         async with ClientSession() as session:
-            # Запрашиваем 3 страницы по 100 монет (всего 300 элементов),
-            # чтобы с запасом набрать 200 реальных альткоинов без стейблкоинов
             for page in range(3):
                 url = (
                     f"https://min-api.cryptocompare.com/data/top/mktcapfull"
@@ -100,7 +128,6 @@ async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
             f"Используем базовый резервный список."
         )
 
-    # Резервный список на случай падения API
     return [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT",
         "ADAUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT", "NEARUSDT", "DOTUSDT",
@@ -108,6 +135,8 @@ async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
         "UNIUSDT", "FETUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", "RENDERUSDT",
         "TAOUSDT", "AAVEUSDT", "INJUSDT", "TIAUSDT", "STXUSDT", "FILUSDT"
     ]
+
+
 # --- 3. ГЕНЕРАЦИЯ ГРАФИКА ---
 def generate_chart_sync(symbol: str, df_40: pd.DataFrame) -> str:
     clean_symbol = symbol.replace("/", "_").replace(":", "")
@@ -124,11 +153,31 @@ def generate_chart_sync(symbol: str, df_40: pd.DataFrame) -> str:
     return image_path
 
 
-# --- 4. МАТЕМАТИЧЕСКИЕ И АЛГОРИТМИЧЕСКИЕ ФИЛЬТРЫ ---
+# --- 4. ПОЛУЧЕНИЕ FUNDING RATE ---
+async def fetch_funding_rate_async(
+    exchange: ccxt_async.bybit, symbol: str
+) -> float:
+    """Получает текущий Funding Rate для криптовалютного фьючерса."""
+    try:
+        ccxt_symbol = to_ccxt_symbol(symbol)
+        ticker = await exchange.fetch_ticker(ccxt_symbol)
+        funding_rate = ticker.get("info", {}).get("fundingRate")
+        if funding_rate:
+            return float(funding_rate)
+    except Exception as e:
+        print(f"⚠️ Ошибка получения Funding Rate для {symbol}: {e}")
+
+    return 0.0
+
+
+# --- 5. МАТЕМАТИЧЕСКИЕ И АЛГОРИТМИЧЕСКИЕ ФИЛЬТРЫ ---
 async def check_economic_news_async(
     session: ClientSession,
 ) -> tuple[bool, str]:
-    """Проверяет отсутствие High Impact новостей по USD/EUR в окне ±30 минут."""
+    """
+    Проверяет отсутствие макроэкономических новостей США в окне ±45 минут
+    и крипто-событий в окне ±2 часа.
+    """
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     now_utc = datetime.now(timezone.utc)
 
@@ -138,27 +187,40 @@ async def check_economic_news_async(
                 return True, "Новостной календарь недоступен (пропущено)"
 
             events = await resp.json()
+
+            us_critical_keywords = [
+                "CPI", "NFP", "Non-Farm", "FOMC", "Interest Rate",
+                "Federal Funds Rate", "Retail Sales", "Unemployment"
+            ]
+
             for event in events:
+                impact = event.get("impact", "")
+                country = event.get("country", "")
+                title = event.get("title", "").upper()
+
+                event_date_str = event.get("date")
+                if not event_date_str:
+                    continue
+
+                try:
+                    event_time = datetime.fromisoformat(event_date_str).astimezone(timezone.utc)
+                except Exception:
+                    continue
+
+                time_diff_minutes = abs((event_time - now_utc).total_seconds()) / 60.0
+
                 if (
-                    event.get("impact") == "High"
-                    and event.get("country") in ["USD", "EUR"]
+                    impact == "High"
+                    and country in ["USD", "EUR"]
+                    and any(kw in title for kw in us_critical_keywords)
+                    and time_diff_minutes <= 45
                 ):
-                    event_date_str = event.get("date")
-                    if not event_date_str:
-                        continue
-                    event_time = datetime.fromisoformat(
-                        event_date_str
-                    ).astimezone(timezone.utc)
-                    time_diff = (
-                        abs((event_time - now_utc).total_seconds()) / 60.0
+                    return (
+                        False,
+                        f"Новость '{event.get('title')}' ({event.get('country')}) через {int(time_diff_minutes)} мин.",
                     )
 
-                    if time_diff <= 30:
-                        return (
-                            False,
-                            f"Новость '{event.get('title')}' ({event.get('country')}) через {int(time_diff)} мин.",
-                        )
-            return True, "Чистый макро-фон"
+            return True, "Чистый макро-фон и крипто-календарь"
     except Exception as e:
         return True, f"Ошибка новостей: {e}"
 
@@ -166,10 +228,12 @@ async def check_economic_news_async(
 async def fetch_htf_context_async(
     exchange: ccxt_async.bybit, symbol: str, current_price: float
 ) -> dict:
-    """Анализирует 1D тренд и ищет зоны 4H POI по закрытым свечам."""
+    """
+    Анализирует 1D тренд и ищет зоны 4H POI по закрытым свечам.
+    Также проверяет, запечатана ли зона (инвалидирована).
+    """
     ccxt_symbol = to_ccxt_symbol(symbol)
 
-    # 1D Тренд по SMA20
     ohlcv_1d = await exchange.fetch_ohlcv(
         ccxt_symbol, timeframe="1d", limit=30
     )
@@ -184,7 +248,6 @@ async def fetch_htf_context_async(
         else "BEARISH"
     )
 
-    # 4H POI по ЗАКРЫТЫМ свечам (отсекаем незакрытую свечу)
     ohlcv_4h = await exchange.fetch_ohlcv(
         ccxt_symbol, timeframe="4h", limit=40
     )
@@ -195,8 +258,8 @@ async def fetch_htf_context_async(
     df_4h_closed = df_4h.iloc[:-1].copy()
 
     poi_detected, poi_type, poi_details = False, "None", ""
+    poi_invalidated = False
 
-    # Поиск 4H FVG
     for i in range(len(df_4h_closed) - 2, 0, -1):
         if df_4h_closed["low"].iloc[i + 1] > df_4h_closed["high"].iloc[i - 1]:
             fvg_low, fvg_high = (
@@ -210,6 +273,9 @@ async def fetch_htf_context_async(
                     f"[{fvg_low:.4f} - {fvg_high:.4f}]",
                 )
                 break
+            elif current_price > fvg_high:
+                poi_invalidated = True
+
         elif (
             df_4h_closed["high"].iloc[i + 1] < df_4h_closed["low"].iloc[i - 1]
         ):
@@ -224,8 +290,9 @@ async def fetch_htf_context_async(
                     f"[{fvg_low:.4f} - {fvg_high:.4f}]",
                 )
                 break
+            elif current_price < fvg_low:
+                poi_invalidated = True
 
-    # Поиск 4H Order Block
     if not poi_detected:
         for i in range(len(df_4h_closed) - 5, len(df_4h_closed)):
             ob_low, ob_high = (
@@ -239,17 +306,23 @@ async def fetch_htf_context_async(
                     f"[{ob_low:.4f} - {ob_high:.4f}]",
                 )
                 break
+            elif current_price > ob_high or current_price < ob_low:
+                poi_invalidated = True
 
     return {
         "global_trend": global_trend,
         "poi_detected": poi_detected,
         "poi_type": poi_type,
         "poi_details": poi_details,
+        "poi_invalidated": poi_invalidated,
     }
 
 
-def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame) -> dict:
-    """Проверяет London Killzone (09:00–12:00 UTC+3), ширину Азиатского боковика (<= 2%) и правила Expansion."""
+def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame, symbol: str = "") -> dict:
+    """
+    Проверяет London Killzone с сезонным сдвигом, ширину Азиатского боковика
+    (2.5% для BTC, 4% для альткоинов) и правила Expansion.
+    """
     df = df_15m.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
@@ -261,19 +334,25 @@ def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame) -> dict:
     df["time_utc3"] = df.index.tz_convert(tz_utc3)
     now_utc3 = datetime.now(tz_utc3)
 
-    # 1. London Killzone (09:00–12:00 UTC+3)
-    if not (9 <= now_utc3.hour < 12):
+    killzone_start, killzone_end = get_london_killzone_window_utc3()
+    current_hour = now_utc3.hour
+
+    if killzone_start < killzone_end:
+        in_killzone = killzone_start <= current_hour < killzone_end
+    else:
+        in_killzone = current_hour >= killzone_start or current_hour < killzone_end
+
+    if not in_killzone:
         return {
             "valid": False,
-            "reason": f"Вне окна London Killzone (сейчас {now_utc3.strftime('%H:%M')} UTC+3)",
+            "reason": f"Вне окна London Killzone (сейчас {now_utc3.strftime('%H:%M')} UTC+3, окно {killzone_start}-{killzone_end})",
         }
 
-    # 2. Asian Range (00:00 - 09:00 UTC+3)
     today = now_utc3.date()
     asian_df = df[
         (df["time_utc3"].dt.date == today)
         & (df["time_utc3"].dt.hour >= 0)
-        & (df["time_utc3"].dt.hour < 9)
+        & (df["time_utc3"].dt.hour < 8)
     ]
 
     if len(asian_df) < 8:
@@ -285,13 +364,15 @@ def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame) -> dict:
     asian_high, asian_low = asian_df["high"].max(), asian_df["low"].min()
     range_pct = ((asian_high - asian_low) / ((asian_high + asian_low) / 2.0)) * 100
 
-    if range_pct > 2.0:
+    is_btc = "BTC" in symbol.upper()
+    max_range_pct = 2.5 if is_btc else 4.0
+
+    if range_pct > max_range_pct:
         return {
             "valid": False,
-            "reason": f"Азиатский диапазон слишком широкий ({range_pct:.2f}%)",
+            "reason": f"Азиатский диапазон слишком широкий ({range_pct:.2f}%, макс {max_range_pct}%)",
         }
 
-    # 3. Дисквалификация: Expansion (2 полнотелые свечи за диапазоном)
     last_2 = df.tail(2)
     closed_above = all(
         c > asian_high and o > asian_high
@@ -318,56 +399,120 @@ def analyze_asian_range_and_disqualification(df_15m: pd.DataFrame) -> dict:
 
 async def check_smt_divergence_async(
     exchange: ccxt_async.bybit, main_symbol: str, swept_side: str
-) -> bool:
-    """Проверяет SMT дивергенцию относительно BTC/USDT (или ETH/USDT для самого BTC)."""
+) -> dict:
+    """Проверяет криптовалютную SMT-дивергенцию между BTC/ETH/SOL."""
     try:
-        paired_symbol = (
-            "ETH/USDT" if "BTC" in main_symbol.upper() else "BTC/USDT"
+        is_btc = "BTC" in main_symbol.upper()
+        if is_btc:
+            paired_symbols = ["ETH/USDT", "SOL/USDT"]
+        else:
+            paired_symbols = ["BTC/USDT", "ETH/USDT"]
+
+        result = {
+            "smt_detected": False,
+            "smt_type": "NONE",
+            "details": "",
+            "pair_analysis": {}
+        }
+
+        ccxt_main = to_ccxt_symbol(main_symbol)
+        ohlcv_main = await exchange.fetch_ohlcv(
+            ccxt_main, timeframe="15m", limit=120
         )
-        # Использование limit=120 для достаточного диапазона свечей
-        ohlcv_pair = await exchange.fetch_ohlcv(
-            paired_symbol, timeframe="15m", limit=120
-        )
-        df_pair = pd.DataFrame(
-            ohlcv_pair,
+        df_main = pd.DataFrame(
+            ohlcv_main,
             columns=["timestamp", "open", "high", "low", "close", "volume"],
         )
-        df_pair["timestamp"] = (
-            pd.to_datetime(df_pair["timestamp"], unit="ms")
+        df_main["timestamp"] = (
+            pd.to_datetime(df_main["timestamp"], unit="ms")
             .dt.tz_localize("UTC")
             .dt.tz_convert(timezone(timedelta(hours=3)))
         )
-        # Отсекаем текущую незакрытую свечу
-        df_pair = df_pair.iloc[:-1].copy()
+        df_main = df_main.iloc[:-1].copy()
 
         now_utc3 = datetime.now(timezone(timedelta(hours=3)))
-        asian_pair = df_pair[
-            (df_pair["timestamp"].dt.date == now_utc3.date())
-            & (df_pair["timestamp"].dt.hour >= 0)
-            & (df_pair["timestamp"].dt.hour < 9)
+        asian_main = df_main[
+            (df_main["timestamp"].dt.date == now_utc3.date())
+            & (df_main["timestamp"].dt.hour >= 0)
+            & (df_main["timestamp"].dt.hour < 9)
         ]
 
-        if asian_pair.empty:
-            return False
+        if asian_main.empty:
+            return result
 
-        pair_asian_high, pair_asian_low = (
-            asian_pair["high"].max(),
-            asian_pair["low"].min(),
-        )
-        last_pair_candle = df_pair.iloc[-1]
+        main_asian_high = asian_main["high"].max()
+        main_asian_low = asian_main["low"].min()
+        main_last = df_main.iloc[-1]
 
-        if swept_side == "LOW":
-            return last_pair_candle["low"] > pair_asian_low
-        elif swept_side == "HIGH":
-            return last_pair_candle["high"] < pair_asian_high
+        for pair_symbol in paired_symbols:
+            try:
+                ohlcv_pair = await exchange.fetch_ohlcv(
+                    pair_symbol, timeframe="15m", limit=120
+                )
+                df_pair = pd.DataFrame(
+                    ohlcv_pair,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                df_pair["timestamp"] = (
+                    pd.to_datetime(df_pair["timestamp"], unit="ms")
+                    .dt.tz_localize("UTC")
+                    .dt.tz_convert(timezone(timedelta(hours=3)))
+                )
+                df_pair = df_pair.iloc[:-1].copy()
 
-        return False
+                asian_pair = df_pair[
+                    (df_pair["timestamp"].dt.date == now_utc3.date())
+                    & (df_pair["timestamp"].dt.hour >= 0)
+                    & (df_pair["timestamp"].dt.hour < 9)
+                ]
+
+                if asian_pair.empty:
+                    continue
+
+                pair_asian_high = asian_pair["high"].max()
+                pair_asian_low = asian_pair["low"].min()
+                pair_last = df_pair.iloc[-1]
+                pair_name = pair_symbol.split("/")[0]
+
+                if swept_side == "LOW":
+                    main_low_swept = main_last["low"] < main_asian_low
+                    pair_high_held = pair_last["low"] >= pair_asian_low
+
+                    if main_low_swept and pair_high_held:
+                        result["smt_detected"] = True
+                        result["smt_type"] = "BULLISH"
+                        result["details"] = f"{main_symbol} обновил Low, {pair_name} удерживает Low (сила)"
+                        result["pair_analysis"][pair_name] = "STRONG"
+                    else:
+                        result["pair_analysis"][pair_name] = "WEAK" if main_low_swept else "ALIGNED"
+
+                elif swept_side == "HIGH":
+                    main_high_swept = main_last["high"] > main_asian_high
+                    pair_high_held = pair_last["high"] <= pair_asian_high
+
+                    if main_high_swept and pair_high_held:
+                        result["smt_detected"] = True
+                        result["smt_type"] = "BEARISH"
+                        result["details"] = f"{main_symbol} обновил High, {pair_name} удерживает High (сила)"
+                        result["pair_analysis"][pair_name] = "STRONG"
+                    else:
+                        result["pair_analysis"][pair_name] = "WEAK" if main_high_swept else "ALIGNED"
+
+            except Exception:
+                pass
+
+        return result
     except Exception as e:
         print(f"⚠️ Ошибка расчета SMT: {e}")
-        return False
+        return {
+            "smt_detected": False,
+            "smt_type": "NONE",
+            "details": f"Ошибка: {e}",
+            "pair_analysis": {}
+        }
 
 
-# --- 5. AGENT 1: GEMINI FLASH VISION ---
+# --- 6. AGENT 1: GEMINI FLASH VISION ---
 async def analyze_gemini_async(
     session: ClientSession, image_path: str, context: dict
 ) -> dict:
@@ -379,15 +524,19 @@ async def analyze_gemini_async(
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
     prompt_text = (
-        f"Ты — SMC аналитик. Проанализируй график {context['symbol']}.\n"
+        f"Ты — SMC аналитик деривативных рынков. Проанализируй график {context['symbol']}.\n"
         f"КОНТЕКСТ: Снят Asian {context['swept_side']} (Границы: Low={context['asian_low']}, High={context['asian_high']}).\n"
-        f"Зона 4H POI: {context['htf_poi']}. SMT Дивергенция: {context['smt_divergence']}.\n"
+        f"Зона 4H POI: {context['htf_poi']}. "
+        f"Funding Rate: {context.get('funding_rate', 0.0)}. "
+        f"SMT Анализ: {context.get('smt_analysis', 'N/A')}.\n"
         "Задачи по графику:\n"
         "1. Оцени качество свипа (тенью или возвратом).\n"
-        "2. Проверь наличие Displacement и CHOCH.\n"
-        "3. Найди FVG для лимитного ордера.\n"
+        "2. Проверь наличие Displacement (агрессивный ответ рынка).\n"
+        "3. Проверь CHOCH (слом структуры на LTF).\n"
+        "4. Найди FVG для лимитного ордера в импульсном движении.\n"
+        "5. Оцени Open Interest метрику (должно быть снижение на момент свипа).\n"
         "Верни СТРОГО JSON без дополнительных пояснений:\n"
-        '{"sweep_quality": "HIGH"|"MEDIUM"|"LOW", "displacement": true, "choch_detected": true, "fvg_detected": true, "comment": "текст"}'
+        '{"sweep_quality": "HIGH"|"MEDIUM"|"LOW", "displacement": true|false, "choch_detected": true|false, "fvg_detected": true|false, "oi_confirmation": "спад с выкупом"|"спад с продажей"|"нет данных", "comment": "текст"}'
     )
 
     payload = {
@@ -423,9 +572,9 @@ async def analyze_gemini_async(
         }
 
 
-# --- 6. AGENT 2: GROQ LLAMA 3.3 ---
+# --- 7. AGENT 2: GROQ LLAMA 3.3 ---
 async def analyze_groq_async(
-    session: ClientSession, vision_res: dict, context: dict
+    session: ClientSession, vision_res: dict, context: dict, entry_timestamp: datetime = None
 ) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -434,17 +583,22 @@ async def analyze_groq_async(
     }
 
     prompt = (
-        f"Ты — Risk Manager сетапа Judas Swing. Прими решение по {context['symbol']}.\n"
+        f"Ты — Risk Manager сетапа Judas Swing для деривативов. Прими решение по {context['symbol']}.\n"
         f"Vision Анализ: {json.dumps(vision_res, ensure_ascii=False)}\n"
-        f"Контекст: Trend={context['global_trend_1d']}, POI={context['htf_poi']}, SMT={context['smt_divergence']}.\n"
-        "Условия:\n"
+        f"Контекст: Trend={context['global_trend_1d']}, POI={context['htf_poi']}, "
+        f"SMT={context['smt_type']}, Funding Rate={context.get('funding_rate', 0.0)}.\n"
+        "Правила дисквалификации:\n"
+        "- Закрепление телом + Рост OI: Цена за границей диапазона с одновременным ростом OI → REJECT\n"
+        "- Отсутствие CHOCH за 45 мин: Боковая консолидация без импульса → REJECT\n"
+        "- Пробой HTF POI: Зона полностью запечатана → REJECT\n"
+        "Условия EXECUTE:\n"
         "1. R:R должен быть строго >= 1:3.\n"
-        "2. При вердикте EXECUTE обязательно рассчитай:\n"
+        "2. Обязательно рассчитай:\n"
         "   - entry_range: диапазон цен для лимитного входа (по зоне FVG/OB), например '64200.0 - 64450.0'\n"
         "   - sl: точный уровень Stop Loss (за уровень свипа)\n"
         "   - tp: точный уровень Take Profit\n\n"
         "Верни СТРОГО JSON:\n"
-        '{"verdict": "EXECUTE"|"REJECT", "entry_range": "мин_цена - макс_цена", "sl": 0.0, "tp": 0.0, "rr": "1:3.5", "reasons": "описание"}'
+        '{"verdict": "EXECUTE"|"REJECT", "entry_range": "мин_цена - макс_цена", "sl": 0.0, "tp": 0.0, "rr": "1:3.5", "reasons": "описание", "disqualification_reason": ""}'
     )
 
     payload = {
@@ -466,20 +620,31 @@ async def analyze_groq_async(
         return {"verdict": "REJECT", "reasons": f"Ошибка API Groq: {e}"}
 
 
-# --- 7. ОТПРАВКА В TELEGRAM ---
+# --- 8. ОТПРАВКА В TELEGRAM ---
 async def send_telegram_async(
     session: ClientSession,
     symbol: str,
     vision_data: dict,
     groq_data: dict,
     image_path: str,
+    additional_context: dict = None,
 ):
     caption = (
-        f"🚨 <b>СИГНАЛ JUDAS SWING: {html.escape(symbol)}</b>\n\n"
+        f"🚨 <b>СИГНАЛ JUDAS SWING (DERIVATIVES): {html.escape(symbol)}</b>\n\n"
         f"📍 <b>Вердикт:</b> <code>{html.escape(str(groq_data.get('verdict')))}</code>\n"
         f"📊 <b>Качество свипа:</b> {html.escape(str(vision_data.get('sweep_quality')))}\n"
-        f"⚡ <b>Displacement / CHOCH / FVG:</b> {vision_data.get('displacement')} / {vision_data.get('choch_detected')} / {vision_data.get('fvg_detected')}\n\n"
+        f"⚡ <b>Displacement / CHOCH / FVG:</b> {vision_data.get('displacement')} / {vision_data.get('choch_detected')} / {vision_data.get('fvg_detected')}\n"
+        f"💾 <b>OI Подтверждение:</b> {vision_data.get('oi_confirmation', 'N/A')}\n\n"
     )
+
+    if additional_context:
+        caption += (
+            f"🔷 <b>Funding Rate:</b> <code>{additional_context.get('funding_rate', 0.0)}</code>\n"
+            f"🧬 <b>SMT Дивергенция:</b> <code>{additional_context.get('smt_type', 'NONE')}</code>\n"
+        )
+        if additional_context.get('smt_details'):
+            caption += f"   {additional_context.get('smt_details')}\n"
+        caption += "\n"
 
     if groq_data.get("verdict") == "EXECUTE":
         caption += (
@@ -493,6 +658,9 @@ async def send_telegram_async(
         f"📝 <b>Анализ:</b> {html.escape(str(vision_data.get('comment', '')))}\n"
         f"🛡 <b>Риск-менеджмент:</b> {html.escape(str(groq_data.get('reasons', '')))}"
     )
+
+    if groq_data.get('disqualification_reason'):
+        caption += f"\n⚠️ <b>Дисквалификация:</b> {html.escape(str(groq_data.get('disqualification_reason')))}"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     data = FormData()
@@ -516,7 +684,7 @@ async def send_telegram_async(
         print(f"❌ Ошибка Telegram: {e}")
 
 
-# --- 8. ОБРАБОТКА ЗАКРЫТИЯ СВЕЧИ СО ВСЕМИ ФИЛЬТРАМИ ---
+# --- 9. ОБРАБОТКА ЗАКРЫТИЯ СВЕЧИ СО ВСЕМИ ФИЛЬТРАМИ ---
 async def process_candle_event(
     session: ClientSession, exchange: ccxt_async.bybit, symbol: str
 ):
@@ -524,9 +692,9 @@ async def process_candle_event(
         f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Свеча 15m закрылась по {symbol}. Запуск проверок..."
     )
     image_path = None
+
     try:
         ccxt_symbol = to_ccxt_symbol(symbol)
-        # Загружаем 120 свечей для корректного перекрытия Азиатской сессии
         ohlcv = await exchange.fetch_ohlcv(
             ccxt_symbol, timeframe="15m", limit=120
         )
@@ -536,12 +704,9 @@ async def process_candle_event(
         )
         df_15m["timestamp"] = pd.to_datetime(df_15m["timestamp"], unit="ms")
         df_15m.set_index("timestamp", inplace=True)
-
-        # Отсекаем текущую незакрытую свечу, чтобы работать строго с закрытыми данными
         df_15m = df_15m.iloc[:-1].copy()
 
-        # 1. Проверка Killzone, ширины Азии и Expansion
-        asian_check = analyze_asian_range_and_disqualification(df_15m)
+        asian_check = analyze_asian_range_and_disqualification(df_15m, symbol)
         if not asian_check["valid"]:
             print(f"ℹ️ [{symbol}] {asian_check['reason']}")
             return
@@ -552,7 +717,6 @@ async def process_candle_event(
         )
         last_candle = df_15m.iloc[-1]
 
-        # 2. Проверка факта свипа ликвидности Азии
         swept_side = None
         if last_candle["low"] < asian_low:
             swept_side = "LOW"
@@ -560,15 +724,13 @@ async def process_candle_event(
             swept_side = "HIGH"
 
         if not swept_side:
-            return  # Нет свипа — выходим без затрат ресурсов
+            return
 
-        # 3. Новостной фильтр (±30 мин)
         news_ok, news_reason = await check_economic_news_async(session)
         if not news_ok:
             print(f"⛔ [{symbol}] {news_reason}")
             return
 
-        # 4. Контекст HTF (4H POI)
         htf_info = await fetch_htf_context_async(
             exchange, symbol, last_candle["close"]
         )
@@ -576,16 +738,15 @@ async def process_candle_event(
             print(f"⛔ [{symbol}] Пропуск: Свип без 4H POI.")
             return
 
-        # 5. SMT Дивергенция
-        smt_present = await check_smt_divergence_async(
+        if htf_info["poi_invalidated"]:
+            print(f"⛔ [{symbol}] Пропуск: 4H POI полностью запечатана (инвалидирована).")
+            return
+
+        funding_rate = await fetch_funding_rate_async(exchange, symbol)
+        smt_result = await check_smt_divergence_async(
             exchange, symbol, swept_side
         )
 
-        print(
-            f"🎯 [{symbol}] Все математические условия выполнены! Вызываем ИИ-агенты..."
-        )
-
-        # 6. Генерация графика и вызов ИИ-агентов (отрисовываем последние 40 закрытых свечей)
         image_path = await asyncio.to_thread(
             generate_chart_sync, symbol, df_15m.tail(40)
         )
@@ -597,7 +758,9 @@ async def process_candle_event(
             "asian_low": asian_low,
             "global_trend_1d": htf_info["global_trend"],
             "htf_poi": f"{htf_info['poi_type']} {htf_info['poi_details']}",
-            "smt_divergence": smt_present,
+            "smt_type": smt_result["smt_type"],
+            "smt_analysis": smt_result.get("details", "N/A"),
+            "funding_rate": funding_rate,
         }
 
         vision_res = await analyze_gemini_async(
@@ -609,13 +772,20 @@ async def process_candle_event(
                 session, vision_res, prompt_data
             )
             if final_decision.get("verdict") == "EXECUTE":
+                additional_ctx = {
+                    "funding_rate": funding_rate,
+                    "smt_type": smt_result["smt_type"],
+                    "smt_details": smt_result.get("details", ""),
+                }
                 await send_telegram_async(
-                    session, symbol, vision_res, final_decision, image_path
+                    session, symbol, vision_res, final_decision, image_path, additional_ctx
                 )
             else:
-                print(
-                    f"⛔ [{symbol}] Отклонено Groq: {final_decision.get('reasons')}"
-                )
+                disq_reason = final_decision.get('disqualification_reason', '')
+                if disq_reason:
+                    print(f"⛔ [{symbol}] Дисквалификация: {disq_reason}")
+                else:
+                    print(f"⛔ [{symbol}] Отклонено Groq: {final_decision.get('reasons')}")
 
     except Exception as e:
         print(f"❌ Ошибка обработки {symbol}: {e}")
@@ -624,7 +794,7 @@ async def process_candle_event(
             os.remove(image_path)
 
 
-# --- 9. WEBSOCKET СЛУШАТЕЛЬ (BYBIT V5) ---
+# --- 10. WEBSOCKET СЛУШАТЕЛЬ (BYBIT V5) ---
 async def send_bybit_ping(ws, end_time):
     try:
         while datetime.now() < end_time:
@@ -649,6 +819,11 @@ async def bybit_websocket_listener(
         f"⏰ Запуск сканирования Bybit на 3 часа (до {end_time.strftime('%H:%M:%S')})..."
     )
 
+    killzone_start, killzone_end = get_london_killzone_window_utc3()
+    is_daylight = get_current_is_daylight_saving()
+    season = "EDT (лето)" if is_daylight else "EST (зима)"
+    print(f"🕐 London Killzone UTC+3: {killzone_start:02d}:00 - {killzone_end:02d}:00 (сейчас {season})")
+
     while datetime.now() < end_time:
         try:
             async with websockets.connect(ws_url) as ws:
@@ -661,13 +836,10 @@ async def bybit_websocket_listener(
 
                 try:
                     while datetime.now() < end_time:
-                        # Таймаут увеличен до 30.0 секунд для снижения лишней нагрузки на CPU
                         msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
                         data = json.loads(msg)
 
-                        if "topic" in data and data["topic"].startswith(
-                            "kline.15."
-                        ):
+                        if "topic" in data and data["topic"].startswith("kline.15."):
                             symbol = data["topic"].split(".")[-1]
                             kline_list = data.get("data", [])
                             for kline in kline_list:
@@ -692,7 +864,7 @@ async def bybit_websocket_listener(
     print("🏁 3 часа работы истекли. Завершаем работу сессии GitHub Actions.")
 
 
-# --- 10. ТОЧКА ВХОДА С ЗАЩИТОЙ ОТ БЛОКИРОВКИ 403 ---
+# --- 11. ТОЧКА ВХОДА С ЗАЩИТОЙ ОТ БЛОКИРОВКИ 403 ---
 async def main():
     exchange = ccxt_async.bybit(
         {
