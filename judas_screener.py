@@ -74,10 +74,10 @@ def get_london_killzone_window_utc3() -> tuple[int, int]:
     return utc3_start, utc3_end
 
 
-# --- 2. ПОЛУЧЕНИЕ ТОП-200 МОНЕТ (CRYPTOCOMPARE API) ---
-async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
-    """Динамически получает ТОП-200 монет по капитализации/объему."""
-    print("🔍 Динамическая загрузка ТОП-200 монет по рынку (CryptoCompare)...")
+# --- 2. ПОЛУЧЕНИЕ ТОП-100 МОНЕТ (CRYPTOCOMPARE API) ---
+async def get_top_100_symbols(exchange: ccxt_async.bybit = None) -> list:
+    """Динамически получает ТОП-100 монет по капитализации/объему."""
+    print("🔍 Динамическая загрузка ТОП-100 монет по рынку (CryptoCompare)...")
 
     # Расширенный список стейблкоинов, обернутых и ликвидных токенов
     stables_and_wraps = {
@@ -109,15 +109,15 @@ async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
                             continue
 
                         top_symbols.append(f"{symbol}USDT")
-                        if len(top_symbols) == 200:
+                        if len(top_symbols) == 100:
                             break
 
-                if len(top_symbols) == 200:
+                if len(top_symbols) == 100:
                     break
 
             if top_symbols:
                 print(
-                    f"✅ Динамический ТОП-200 загружен ({len(top_symbols)} монет). "
+                    f"✅ Динамический ТОП-100 загружен ({len(top_symbols)} монет). "
                     f"Первые 5: {', '.join(top_symbols[:5])}..."
                 )
                 return top_symbols
@@ -134,8 +134,7 @@ async def get_top_200_symbols(exchange: ccxt_async.bybit = None) -> list:
         "LTCUSDT", "APTUSDT", "PEPEUSDT", "SHIBUSDT", "TRXUSDT", "BCHUSDT",
         "UNIUSDT", "FETUSDT", "ICPUSDT", "ETCUSDT", "XLMUSDT", "RENDERUSDT",
         "TAOUSDT", "AAVEUSDT", "INJUSDT", "TIAUSDT", "STXUSDT", "FILUSDT"
-    ]
-
+    ][:100]
 
 # --- 3. ГЕНЕРАЦИЯ ГРАФИКА ---
 def generate_chart_sync(symbol: str, df_40: pd.DataFrame) -> str:
